@@ -4,7 +4,7 @@ import matplotlib.animation as animation
 import random
 import matplotlib.patches as mpatches
 import socket
-import threading
+import multiprocessing 
 
 #HOST = "192.168.1.98"
 #PORT = 8000
@@ -31,9 +31,8 @@ CO_INJ = [1000]*NUM_POINTS #co for car w/ fuel injector
 co_g = 0.0
 co2_g = 0.0
 connection_g = True
-thread_lock = threading.Lock()
 
-def openNewConnection():
+def openNewConnection(server_socket):
     while True:
         try:
             server_socket.listen(5) #server_socket defined in main below
@@ -46,11 +45,15 @@ def openNewConnection():
             print("Connection Not Found. Refreshing.")
 
 
-def getData():
-    global co_g
-    global co2_g
-    global connection_g
-    client_socket = openNewConnection()
+def getData(proc_conn):
+    co = 0.0
+    co2 = 0.0
+    connection = False
+    proc_conn.send({"co":co, "co2":co2, "conn":connection})
+    server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server_socket.bind((HOST, PORT))
+    print("Socket Bound Sucessfully")
+    client_socket = openNewConnection(server_socket)
     while True:
         try:
             skt_raw = client_socket.recv(1024)
@@ -60,45 +63,42 @@ def getData():
             skt_str = skt_raw.decode("utf-8")
             co = float(skt_str.split("\t")[0].strip())
             co2 = float(skt_str.split("\t")[1].strip())
-            
-            with thread_lock:
-                co_g = co
-                if co2 < 1000000.0:
-                    co2_g = co2
-                connection_g = True
+            connection = True
 
         except ValueError:
-            with thread_lock:
-                connection_g=False
-            print("Packet Messed Up: Unalble to Convert!")
+            connection=False
+            print("Packet Messed Up: Unable to Convert!")
 
         except (socket.error, Exception):
-            with thread_lock:
-                connection_g=False
+            connection=False
             print("Socket error or disconnect!")
             client_socket.close()
-            client_socket = openNewConnection()
+            client_socket = openNewConnection(server_socket)
         
-        
+        proc_conn.send({"co":co, "co2":co2, "conn":connection})
 
 def logToFile(co, co2, timestamp):
     with open("sensorData.log", "a+") as log_file:
         log_file.write("Timestamp: {0},\t CO: {1:.2f},\t CO2: {2:.2f} \n".format(str(timestamp), co, co2))
 
-def drawChart(i, co_list, co2_list, times):
+def drawChart(i, co_list, co2_list, times, proc_conn):
+    global co_g
+    global co2_g
+    global connection_g
     # Get Data
     timestamp = dt.datetime.now().strftime('%H:%M:%S')
-    with thread_lock:
-        co = co_g
-        co2 = co2_g
-        connection = connection_g #Can use this to signal disconnect on graph
+    while proc_conn.poll():
+        data = proc_conn.recv()
+        co_g = data["co"]
+        co2_g = data["co2"]
+        connection_g = data["conn"] #Can use this to signal disconnect on graph
 
-    logToFile(co, co2, timestamp)
+    logToFile(co_g, co2_g, timestamp)
 
     # Add to lists
     times.append(timestamp)
-    co_list.append(co)
-    co2_list.append(co2)
+    co_list.append(co_g)
+    co2_list.append(co2_g)
 
     # Limit x and y lists to NUM_POINTS items
     co_list = co_list[-NUM_POINTS:]
@@ -137,21 +137,18 @@ def drawChart(i, co_list, co2_list, times):
 
 
 
-# Begin Main
-server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-server_socket.bind((HOST, PORT))
-print("Socket Bound Sucessfully")
+if __name__ == "__main__":
+    # Create figure for plotting
+    fig, (co_plot, co2_plot) = plt.subplots(2, 1, sharex=True)
+    co_list_g = []
+    co2_list_g = []
+    times_g = []
 
-# Create figure for plotting
-fig, (co_plot, co2_plot) = plt.subplots(2, 1, sharex=True)
-co_list_g = []
-co2_list_g = []
-times_g = []
+    # Set up data collection worker
+    pipe_receive, pipe_send = multiprocessing.Pipe(duplex=False)
+    data_proc = multiprocessing.Process(target=getData, args=[pipe_send])
+    data_proc.start()
 
-getDataThread = threading.Thread(target = getData)
-getDataThread.daemon = True
-getDataThread.start()
-
-# Set up plot to call animate() function periodically
-ani = animation.FuncAnimation(fig, drawChart, fargs=(co_list_g, co2_list_g, times_g), interval=1000)
-plt.show()
+    # Set up plot to call animate() function periodically
+    ani = animation.FuncAnimation(fig, drawChart, fargs=(co_list_g, co2_list_g, times_g, pipe_receive), interval=1000)
+    plt.show()
